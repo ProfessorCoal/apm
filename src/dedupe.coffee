@@ -17,7 +17,7 @@ class Dedupe extends Command
     @atomPackagesDirectory = path.join(@atomDirectory, 'packages')
     @atomNodeDirectory = path.join(@atomDirectory, '.node-gyp')
     @atomNpmPath = require.resolve('npm/bin/npm-cli')
-    @atomNodeGypPath = require.resolve('npm/node_modules/node-gyp/bin/node-gyp')
+    @atomNodeGypPath = require.resolve('node-gyp/bin/node-gyp')
 
   parseOptions: (argv) ->
     options = yargs(argv).wrap(100)
@@ -33,9 +33,10 @@ class Dedupe extends Command
 
   installNode: (callback) ->
     installNodeArgs = ['install']
-    installNodeArgs.push("--target=#{config.getNodeVersion()}")
-    installNodeArgs.push("--dist-url=#{config.getNodeUrl()}")
-    installNodeArgs.push('--arch=ia32')
+    installNodeArgs.push("--runtime=electron")
+    installNodeArgs.push("--target=#{@electronVersion}")
+    installNodeArgs.push("--dist-url=#{config.getElectronUrl()}")
+    installNodeArgs.push("--arch=#{config.getElectronArch()}")
     installNodeArgs.push('--ensure')
 
     env = _.extend({}, process.env, HOME: @atomNodeDirectory)
@@ -50,7 +51,7 @@ class Dedupe extends Command
       env.NODE_TLS_REJECT_UNAUTHORIZED = 0 unless useStrictSsl
 
       # Pass through configured proxy to node-gyp
-      proxy = npm.config.get('https-proxy') or npm.config.get('proxy')
+      proxy = npm.config.get('https-proxy') or npm.config.get('proxy') or env.HTTPS_PROXY or env.HTTP_PROXY
       installNodeArgs.push("--proxy=#{proxy}") if proxy
 
       @fork @atomNodeGypPath, installNodeArgs, {env, cwd: @atomDirectory}, (code, stderr='', stdout='') ->
@@ -71,8 +72,9 @@ class Dedupe extends Command
 
   forkDedupeCommand: (options, callback) ->
     dedupeArgs = ['--globalconfig', config.getGlobalConfigPath(), '--userconfig', config.getUserConfigPath(), 'dedupe']
-    dedupeArgs.push("--target=#{config.getNodeVersion()}")
-    dedupeArgs.push('--arch=ia32')
+    dedupeArgs.push("--runtime=electron")
+    dedupeArgs.push("--target=#{@electronVersion}")
+    dedupeArgs.push("--arch=#{config.getElectronArch()}")
     dedupeArgs.push('--silent') if options.argv.silent
     dedupeArgs.push('--quiet') if options.argv.quiet
 
@@ -100,6 +102,7 @@ class Dedupe extends Command
     @createAtomDirectories()
 
     commands = []
+    commands.push (callback) => @loadInstalledAtomMetadata(callback)
     commands.push (callback) => @installNode(callback)
     commands.push (callback) => @dedupeModules(options, callback)
     async.waterfall commands, callback

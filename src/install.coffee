@@ -1,30 +1,32 @@
+assert = require 'assert'
 path = require 'path'
 
-async = require 'async'
 _ = require 'underscore-plus'
-yargs = require 'yargs'
+async = require 'async'
 CSON = require 'season'
-semver = require 'npm/node_modules/semver'
+yargs = require 'yargs'
+Git = require 'git-utils'
+semver = require 'semver'
 temp = require 'temp'
+hostedGitInfo = require 'hosted-git-info'
 
 config = require './apm'
 Command = require './command'
 fs = require './fs'
-git = require './git'
 RebuildModuleCache = require './rebuild-module-cache'
 request = require './request'
 {isDeprecatedPackage} = require './deprecated-packages'
 
 module.exports =
 class Install extends Command
-  @commandNames: ['install']
+  @commandNames: ['install', 'i']
 
   constructor: ->
     @atomDirectory = config.getAtomDirectory()
     @atomPackagesDirectory = path.join(@atomDirectory, 'packages')
     @atomNodeDirectory = path.join(@atomDirectory, '.node-gyp')
     @atomNpmPath = require.resolve('npm/bin/npm-cli')
-    @atomNodeGypPath = require.resolve('npm/node_modules/node-gyp/bin/node-gyp')
+    @atomNodeGypPath = require.resolve('node-gyp/bin/node-gyp')
 
   parseOptions: (argv) ->
     options = yargs(argv).wrap(100)
@@ -32,7 +34,10 @@ class Install extends Command
 
       Usage: apm install [<package_name>...]
              apm install <package_name>@<package_version>
+             apm install <git_remote>
+             apm install <github_username>/<github_project>
              apm install --packages-file my-packages.txt
+             apm i (with any of the previous argument usage)
 
       Install the given Atom package to ~/.atom/packages/<package_name>.
 
@@ -55,9 +60,10 @@ class Install extends Command
 
   installNode: (callback) =>
     installNodeArgs = ['install']
-    installNodeArgs.push("--target=#{config.getNodeVersion()}")
-    installNodeArgs.push("--dist-url=#{config.getNodeUrl()}")
-    installNodeArgs.push("--arch=#{config.getNodeArch()}")
+    installNodeArgs.push("--runtime=electron")
+    installNodeArgs.push("--target=#{@electronVersion}")
+    installNodeArgs.push("--dist-url=#{config.getElectronUrl()}")
+    installNodeArgs.push("--arch=#{config.getElectronArch()}")
     installNodeArgs.push("--ensure")
     installNodeArgs.push("--verbose") if @verbose
 
@@ -73,7 +79,7 @@ class Install extends Command
     env.NODE_TLS_REJECT_UNAUTHORIZED = 0 unless useStrictSsl
 
     # Pass through configured proxy to node-gyp
-    proxy = @npm.config.get('https-proxy') or @npm.config.get('proxy')
+    proxy = @npm.config.get('https-proxy') or @npm.config.get('proxy') or env.HTTPS_PROXY or env.HTTP_PROXY
     installNodeArgs.push("--proxy=#{proxy}") if proxy
 
     opts = {env, cwd: @atomDirectory}
@@ -85,42 +91,15 @@ class Install extends Command
       else
         callback("#{stdout}\n#{stderr}")
 
-  updateWindowsEnv: (env) ->
-    env.USERPROFILE = env.HOME
-
-    # Make sure node-gyp is always on the PATH
-    localModuleBins = path.resolve(__dirname, '..', 'node_modules', '.bin')
-    if env.Path
-      env.Path += "#{path.delimiter}#{localModuleBins}"
-    else
-      env.Path = localModuleBins
-
-    git.addGitToEnv(env)
-
-  addNodeBinToEnv: (env) ->
-    nodeBinFolder = path.resolve(__dirname, '..', 'bin')
-    pathKey = if config.isWin32() then 'Path' else 'PATH'
-    if env[pathKey]
-      env[pathKey] = "#{nodeBinFolder}#{path.delimiter}#{env[pathKey]}"
-    else
-      env[pathKey]= nodeBinFolder
-
-  addProxyToEnv: (env) ->
-    httpProxy = @npm.config.get('proxy')
-    if httpProxy
-      env.HTTP_PROXY ?= httpProxy
-      env.http_proxy ?= httpProxy
-
-    httpsProxy = @npm.config.get('https-proxy')
-    if httpsProxy
-      env.HTTPS_PROXY ?= httpsProxy
-      env.https_proxy ?= httpsProxy
-
   installModule: (options, pack, modulePath, callback) ->
+    installGlobally = options.installGlobally ? true
+
     installArgs = ['--globalconfig', config.getGlobalConfigPath(), '--userconfig', config.getUserConfigPath(), 'install']
     installArgs.push(modulePath)
-    installArgs.push("--target=#{config.getNodeVersion()}")
-    installArgs.push("--arch=#{config.getNodeArch()}")
+    installArgs.push("--runtime=electron")
+    installArgs.push("--target=#{@electronVersion}")
+    installArgs.push("--arch=#{config.getElectronArch()}")
+    installArgs.push("--global-style") if installGlobally
     installArgs.push('--silent') if options.argv.silent
     installArgs.push('--quiet') if options.argv.quiet
     installArgs.push('--production') if options.argv.production
@@ -129,13 +108,10 @@ class Install extends Command
       installArgs.push(vsArgs)
 
     env = _.extend({}, process.env, HOME: @atomNodeDirectory)
-    @updateWindowsEnv(env) if config.isWin32()
-    @addNodeBinToEnv(env)
-    @addProxyToEnv(env)
+    @addBuildEnvVars(env)
     installOptions = {env}
     installOptions.streaming = true if @verbose
 
-    installGlobally = options.installGlobally ? true
     if installGlobally
       installDirectory = temp.mkdirSync('apm-install-dir-')
       nodeModulesDirectory = path.join(installDirectory, 'node_modules')
@@ -146,23 +122,24 @@ class Install extends Command
       if code is 0
         if installGlobally
           commands = []
-          for child in fs.readdirSync(nodeModulesDirectory)
-            source = path.join(nodeModulesDirectory, child)
-            destination = path.join(@atomPackagesDirectory, child)
-            do (source, destination) ->
-              commands.push (callback) -> fs.cp(source, destination, callback)
-
-          commands.push (callback) => @buildModuleCache(pack.name, callback)
-          commands.push (callback) => @warmCompileCache(pack.name, callback)
+          children = fs.readdirSync(nodeModulesDirectory)
+            .filter (dir) -> dir isnt ".bin"
+          assert.equal(children.length, 1, "Expected there to only be one child in node_modules")
+          child = children[0]
+          source = path.join(nodeModulesDirectory, child)
+          destination = path.join(@atomPackagesDirectory, child)
+          commands.push (next) -> fs.cp(source, destination, next)
+          commands.push (next) => @buildModuleCache(pack.name, next)
+          commands.push (next) => @warmCompileCache(pack.name, next)
 
           async.waterfall commands, (error) =>
             if error?
               @logFailure()
             else
-              @logSuccess()
-            callback(error)
+              @logSuccess() unless options.argv.json
+            callback(error, {name: child, installPath: destination})
         else
-          callback()
+          callback(null, {name: child, installPath: destination})
       else
         if installGlobally
           fs.removeSync(installDirectory)
@@ -203,20 +180,20 @@ class Install extends Command
 
     message
 
-  getVisualStudioFlags: ->
-    if vsVersion = config.getInstalledVisualStudioFlag()
-      "--msvs_version=#{vsVersion}"
-
   installModules: (options, callback) =>
-    process.stdout.write 'Installing modules '
+    process.stdout.write 'Installing modules ' unless options.argv.json
 
     @forkInstallCommand options, (args...) =>
-      @logCommandResults(callback, args...)
+      if options.argv.json
+        @logCommandResultsIfFail(callback, args...)
+      else
+        @logCommandResults(callback, args...)
 
   forkInstallCommand: (options, callback) ->
     installArgs = ['--globalconfig', config.getGlobalConfigPath(), '--userconfig', config.getUserConfigPath(), 'install']
-    installArgs.push("--target=#{config.getNodeVersion()}")
-    installArgs.push("--arch=#{config.getNodeArch()}")
+    installArgs.push("--runtime=electron")
+    installArgs.push("--target=#{@electronVersion}")
+    installArgs.push("--arch=#{config.getElectronArch()}")
     installArgs.push('--silent') if options.argv.silent
     installArgs.push('--quiet') if options.argv.quiet
     installArgs.push('--production') if options.argv.production
@@ -331,21 +308,22 @@ class Install extends Command
   # options - The installation options object.
   # callback - The function to invoke when installation completes with an
   #            error as the first argument.
-  installPackage: (metadata, options, callback) ->
+  installRegisteredPackage: (metadata, options, callback) ->
     packageName = metadata.name
     packageVersion = metadata.version
 
     installGlobally = options.installGlobally ? true
     unless installGlobally
       if packageVersion and @isPackageInstalled(packageName, packageVersion)
-        callback()
+        callback(null, {})
         return
 
     label = packageName
     label += "@#{packageVersion}" if packageVersion
-    process.stdout.write "Installing #{label} "
-    if installGlobally
-      process.stdout.write "to #{@atomPackagesDirectory} "
+    unless options.argv.json
+      process.stdout.write "Installing #{label} "
+      if installGlobally
+        process.stdout.write "to #{@atomPackagesDirectory} "
 
     @requestPackage packageName, (error, pack) =>
       if error?
@@ -356,6 +334,7 @@ class Install extends Command
         unless packageVersion
           @logFailure()
           callback("No available version compatible with the installed Atom version: #{@installedAtomVersion}")
+          return
 
         {tarball} = pack.versions[packageVersion]?.dist ? {}
         unless tarball
@@ -364,26 +343,33 @@ class Install extends Command
           return
 
         commands = []
-        commands.push (callback) =>
+        commands.push (next) =>
           @getPackageCachePath packageName, packageVersion, (error, packagePath) =>
             if packagePath
-              callback(null, packagePath)
+              next(null, packagePath)
             else
-              @downloadPackage(tarball, installGlobally, callback)
+              @downloadPackage(tarball, installGlobally, next)
         installNode = options.installNode ? true
         if installNode
-          commands.push (packagePath, callback) =>
-            @installNode (error) -> callback(error, packagePath)
-        commands.push (packagePath, callback) =>
-          @installModule(options, pack, packagePath, callback)
+          commands.push (packagePath, next) =>
+            @installNode (error) -> next(error, packagePath)
+        commands.push (packagePath, next) =>
+          @installModule(options, pack, packagePath, next)
+        commands.push ({installPath}, next) ->
+          if installPath?
+            metadata = JSON.parse(fs.readFileSync(path.join(installPath, 'package.json'), 'utf8'))
+            json = {installPath, metadata}
+            next(null, json)
+          else
+            next(null, {}) # installed locally, no install path data
 
-        async.waterfall commands, (error) =>
+        async.waterfall commands, (error, json) =>
           unless installGlobally
             if error?
               @logFailure()
             else
-              @logSuccess()
-          callback(error)
+              @logSuccess() unless options.argv.json
+          callback(error, json)
 
   # Install all the package dependencies found in the package.json file.
   #
@@ -395,10 +381,10 @@ class Install extends Command
     commands = []
     for name, version of @getPackageDependencies()
       do (name, version) =>
-        commands.push (callback) =>
-          @installPackage({name, version}, options, callback)
+        commands.push (next) =>
+          @installRegisteredPackage({name, version}, options, next)
 
-    async.waterfall(commands, callback)
+    async.series(commands, callback)
 
   installDependencies: (options, callback) ->
     options.installGlobally = false
@@ -435,8 +421,9 @@ class Install extends Command
 
       buildArgs = ['--globalconfig', config.getGlobalConfigPath(), '--userconfig', config.getUserConfigPath(), 'build']
       buildArgs.push(path.resolve(__dirname, '..', 'native-module'))
-      buildArgs.push("--target=#{config.getNodeVersion()}")
-      buildArgs.push("--arch=#{config.getNodeArch()}")
+      buildArgs.push("--runtime=electron")
+      buildArgs.push("--target=#{@electronVersion}")
+      buildArgs.push("--arch=#{config.getElectronArch()}")
 
       if vsArgs = @getVisualStudioFlags()
         buildArgs.push(vsArgs)
@@ -461,12 +448,6 @@ class Install extends Command
 
     packages = fs.readFileSync(filePath, 'utf8')
     @sanitizePackageNames(packages.split(/\s/))
-
-  getResourcePath: (callback) ->
-    if @resourcePath
-      process.nextTick => callback(@resourcePath)
-    else
-      config.getResourcePath (@resourcePath) => callback(@resourcePath)
 
   buildModuleCache: (packageName, callback) ->
     packageDirectory = path.join(@atomPackagesDirectory, packageName)
@@ -523,13 +504,104 @@ class Install extends Command
 
     latestVersion
 
-  loadInstalledAtomVersion: (callback) ->
-    @getResourcePath (resourcePath) =>
-      try
-        {version} = require(path.join(resourcePath, 'package.json')) ? {}
-        version = @normalizeVersion(version)
-        @installedAtomVersion = version if semver.valid(version)
-      callback()
+  getHostedGitInfo: (name) ->
+    hostedGitInfo.fromUrl(name)
+
+  installGitPackage: (packageUrl, options, callback) ->
+    tasks = []
+
+    cloneDir = temp.mkdirSync("atom-git-package-clone-")
+
+    tasks.push (data, next) =>
+      urls = @getNormalizedGitUrls(packageUrl)
+      @cloneFirstValidGitUrl urls, cloneDir, options, (err) ->
+        next(err, data)
+
+    tasks.push (data, next) =>
+      @installGitPackageDependencies cloneDir, options, (err) ->
+        next(err, data)
+
+    tasks.push (data, next) =>
+      @getRepositoryHeadSha cloneDir, (err, sha) ->
+        data.sha = sha
+        next(err, data)
+
+    tasks.push (data, next) ->
+      metadataFilePath = CSON.resolve(path.join(cloneDir, 'package'))
+      CSON.readFile metadataFilePath, (err, metadata) ->
+        data.metadataFilePath = metadataFilePath
+        data.metadata = metadata
+        next(err, data)
+
+    tasks.push (data, next) ->
+      data.metadata.apmInstallSource =
+        type: "git"
+        source: packageUrl
+        sha: data.sha
+      CSON.writeFile data.metadataFilePath, data.metadata, (err) ->
+        next(err, data)
+
+    tasks.push (data, next) =>
+      {name} = data.metadata
+      targetDir = path.join(@atomPackagesDirectory, name)
+      process.stdout.write "Moving #{name} to #{targetDir} " unless options.argv.json
+      fs.cp cloneDir, targetDir, (err) =>
+        if err
+          next(err)
+        else
+          @logSuccess() unless options.argv.json
+          json = {installPath: targetDir, metadata: data.metadata}
+          next(null, json)
+
+    iteratee = (currentData, task, next) -> task(currentData, next)
+    async.reduce tasks, {}, iteratee, callback
+
+  getNormalizedGitUrls: (packageUrl) ->
+    packageInfo = @getHostedGitInfo(packageUrl)
+
+    if packageUrl.indexOf('file://') is 0
+      [packageUrl]
+    else if packageInfo.default is 'sshurl'
+      [packageInfo.toString()]
+    else if packageInfo.default is 'https'
+      [packageInfo.https().replace(/^git\+https:/, "https:")]
+    else if packageInfo.default is 'shortcut'
+      [
+        packageInfo.https().replace(/^git\+https:/, "https:"),
+        packageInfo.sshurl()
+      ]
+
+  cloneFirstValidGitUrl: (urls, cloneDir, options, callback) ->
+    async.detectSeries urls, (url, next) =>
+      @cloneNormalizedUrl url, cloneDir, options, (error) ->
+        next(not error)
+    , (result) ->
+      if not result
+        invalidUrls = "Couldn't clone #{urls.join(' or ')}"
+        invalidUrlsError = new Error(invalidUrls)
+        callback(invalidUrlsError)
+      else
+        callback()
+
+  cloneNormalizedUrl: (url, cloneDir, options, callback) ->
+    # Require here to avoid circular dependency
+    Develop = require './develop'
+    develop = new Develop()
+
+    develop.cloneRepository url, cloneDir, options, (err) ->
+      callback(err)
+
+  installGitPackageDependencies: (directory, options, callback) =>
+    options.cwd = directory
+    @installDependencies(options, callback)
+
+  getRepositoryHeadSha: (repoDir, callback) ->
+    try
+      repo = Git.open(repoDir)
+      sha = repo.getReferenceTarget("HEAD")
+      callback(null, sha)
+    catch err
+      callback(err)
 
   run: (options) ->
     {callback} = options
@@ -539,7 +611,9 @@ class Install extends Command
     @createAtomDirectories()
 
     if options.argv.check
-      config.loadNpm (error, @npm) => @checkNativeBuildTools(callback)
+      config.loadNpm (error, @npm) =>
+        @loadInstalledAtomMetadata =>
+          @checkNativeBuildTools(callback)
       return
 
     @verbose = options.argv.verbose
@@ -547,10 +621,14 @@ class Install extends Command
       request.debug(true)
       process.env.NODE_DEBUG = 'request'
 
-    installPackage = (name, callback) =>
-      if name is '.'
-        @installDependencies(options, callback)
-      else
+    installPackage = (name, nextInstallStep) =>
+      gitPackageInfo = @getHostedGitInfo(name)
+
+      if gitPackageInfo or name.indexOf('file://') is 0
+        @installGitPackage name, options, nextInstallStep
+      else if name is '.'
+        @installDependencies(options, nextInstallStep)
+      else # is registered package
         atIndex = name.indexOf('@')
         if atIndex > 0
           version = name.substring(atIndex + 1)
@@ -563,7 +641,7 @@ class Install extends Command
               You can run `apm uninstall #{name}` to uninstall it and then the version bundled
               with Atom will be used.
             """.yellow
-          @installPackage({name, version}, options, callback)
+          @installRegisteredPackage({name, version}, options, nextInstallStep)
 
     if packagesFilePath
       try
@@ -575,8 +653,15 @@ class Install extends Command
       packageNames.push('.') if packageNames.length is 0
 
     commands = []
-    commands.push (callback) => config.loadNpm (error, @npm) => callback()
-    commands.push (callback) => @loadInstalledAtomVersion(callback)
+    commands.push (callback) => config.loadNpm (error, @npm) => callback(error)
+    commands.push (callback) => @loadInstalledAtomMetadata -> callback()
     packageNames.forEach (packageName) ->
       commands.push (callback) -> installPackage(packageName, callback)
-    async.waterfall(commands, callback)
+    iteratee = (item, next) -> item(next)
+    async.mapSeries commands, iteratee, (err, installedPackagesInfo) ->
+      return callback(err) if err
+      installedPackagesInfo = _.compact(installedPackagesInfo)
+      installedPackagesInfo = installedPackagesInfo.filter (item, idx) ->
+        packageNames[idx] isnt "."
+      console.log(JSON.stringify(installedPackagesInfo, null, "  ")) if options.argv.json
+      callback(null)

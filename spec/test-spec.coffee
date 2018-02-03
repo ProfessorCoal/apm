@@ -16,15 +16,12 @@ describe "apm test", ->
     specPath = path.join(currentDir, 'spec')
 
   it "calls atom to test", ->
-    atomSpawn = spyOn(child_process, 'spawn').andReturn({
-      stdout: {
+    atomSpawn = spyOn(child_process, 'spawn').andReturn
+      stdout:
         on: ->
-      },
-      stderr: {
+      stderr:
         on: ->
-      },
       on: ->
-    })
     apm.run(['test'])
 
     waitsFor 'waiting for test to complete', ->
@@ -35,12 +32,11 @@ describe "apm test", ->
         expect(atomSpawn.mostRecentCall.args[1][2].indexOf('atom')).not.toBe -1
         expect(atomSpawn.mostRecentCall.args[1][2].indexOf('--dev')).not.toBe -1
         expect(atomSpawn.mostRecentCall.args[1][2].indexOf('--test')).not.toBe -1
-        expect(atomSpawn.mostRecentCall.args[1][2].indexOf('--spec-directory')).not.toBe -1
       else
         expect(atomSpawn.mostRecentCall.args[0]).toEqual 'atom'
         expect(atomSpawn.mostRecentCall.args[1][0]).toEqual '--dev'
         expect(atomSpawn.mostRecentCall.args[1][1]).toEqual '--test'
-        expect(atomSpawn.mostRecentCall.args[1][2]).toEqual "--spec-directory=#{specPath}"
+        expect(atomSpawn.mostRecentCall.args[1][2]).toEqual specPath
         expect(atomSpawn.mostRecentCall.args[2].streaming).toBeTruthy()
 
   describe 'returning', ->
@@ -49,14 +45,13 @@ describe "apm test", ->
     returnWithCode = (type, code) ->
       callback = jasmine.createSpy('callback')
       atomReturnFn = (e, fn) -> fn(code) if e is type
-      spyOn(child_process, 'spawn').andReturn({
-        stdout: {
+      spyOn(child_process, 'spawn').andReturn
+        stdout:
           on: ->
-        },
-        stderr: {
+        stderr:
           on: ->
-        },
-        on: atomReturnFn})
+        on: atomReturnFn
+        removeListener: -> # no op
       apm.run(['test'], callback)
 
     describe 'successfully', ->

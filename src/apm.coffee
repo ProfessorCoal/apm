@@ -2,7 +2,7 @@ child_process = require 'child_process'
 fs = require './fs'
 path = require 'path'
 npm = require 'npm'
-semver = require 'npm/node_modules/semver'
+semver = require 'semver'
 
 module.exports =
   getHomeDirectory: ->
@@ -51,8 +51,8 @@ module.exports =
   getReposDirectory: ->
     process.env.ATOM_REPOS_HOME ? path.join(@getHomeDirectory(), 'github')
 
-  getNodeUrl: ->
-    process.env.ATOM_NODE_URL ? 'https://atom.io/download/atom-shell'
+  getElectronUrl: ->
+    process.env.ATOM_ELECTRON_URL ? 'https://atom.io/download/atom-shell'
 
   getAtomPackagesUrl: ->
     process.env.ATOM_PACKAGES_URL ? "#{@getAtomApiUrl()}/packages"
@@ -60,10 +60,7 @@ module.exports =
   getAtomApiUrl: ->
     process.env.ATOM_API_URL ? 'https://atom.io/api'
 
-  getNodeVersion: ->
-    process.env.ATOM_NODE_VERSION ? '0.22.0'
-
-  getNodeArch: ->
+  getElectronArch: ->
     switch process.platform
       when 'darwin' then 'x64'
       when 'win32' then 'ia32'
@@ -90,14 +87,13 @@ module.exports =
     # Use the explictly-configured version when set
     return process.env.GYP_MSVS_VERSION if process.env.GYP_MSVS_VERSION
 
-    vs2013Path = path.join(@x86ProgramFilesDirectory(), "Microsoft Visual Studio 12.0", "Common7", "IDE")
-    return '2013' if fs.existsSync(vs2013Path)
+    return '2015' if @visualStudioIsInstalled("14.0")
+    return '2013' if @visualStudioIsInstalled("12.0")
+    return '2012' if @visualStudioIsInstalled("11.0")
+    return '2010' if @visualStudioIsInstalled("10.0")
 
-    vs2012Path = path.join(@x86ProgramFilesDirectory(), "Microsoft Visual Studio 11.0", "Common7", "IDE")
-    return '2012' if fs.existsSync(vs2012Path)
-
-    vs2010Path = path.join(@x86ProgramFilesDirectory(), "Microsoft Visual Studio 10.0", "Common7", "IDE")
-    return '2010' if fs.existsSync(vs2010Path)
+  visualStudioIsInstalled: (version) ->
+    fs.existsSync(path.join(@x86ProgramFilesDirectory(), "Microsoft Visual Studio #{version}", "Common7", "IDE"))
 
   loadNpm: (callback) ->
     npmOptions =
@@ -116,5 +112,6 @@ module.exports =
         ;
         ; You should instead edit your .apmrc config located in ~/.atom/.apmrc
         cache = #{@getCacheDirectory()}
-
+        ; Hide progress-bar to prevent npm from altering apm console output.
+        progress = false
       """

@@ -9,12 +9,15 @@ module.exports =
 class Init extends Command
   @commandNames: ['init']
 
+  supportedSyntaxes: ['coffeescript', 'javascript']
+
   parseOptions: (argv) ->
     options = yargs(argv).wrap(100)
 
     options.usage """
       Usage:
         apm init -p <package-name>
+        apm init -p <package-name> --syntax <javascript-or-coffeescript>
         apm init -p <package-name> -c ~/Downloads/r.tmbundle
         apm init -p <package-name> -c https://github.com/textmate/r.tmbundle
         apm init -p <package-name> --template /path/to/your/package/template
@@ -33,6 +36,7 @@ class Init extends Command
       on the option selected.
     """
     options.alias('p', 'package').string('package').describe('package', 'Generates a basic package')
+    options.alias('s', 'syntax').string('syntax').describe('syntax', 'Sets package syntax to CoffeeScript or JavaScript')
     options.alias('t', 'theme').string('theme').describe('theme', 'Generates a basic theme')
     options.alias('u', 'ui-theme').string('ui-theme').describe('ui-theme', 'Generates a basic UI theme')
     options.alias('l', 'language').string('language').describe('language', 'Generates a basic language package')
@@ -48,7 +52,10 @@ class Init extends Command
         @convertPackage(options.argv.convert, options.argv.package, callback)
       else
         packagePath = path.resolve(options.argv.package)
-        templatePath = @getTemplatePath(options.argv, 'package')
+        syntax = options.argv.syntax or @supportedSyntaxes[0]
+        if syntax not in @supportedSyntaxes
+          return callback("You must specify one of #{@supportedSyntaxes.join(', ')} after the --syntax argument")
+        templatePath = @getTemplatePath(options.argv, "package-#{syntax}")
         @generateFromTemplate(packagePath, templatePath)
         callback()
     else if options.argv.theme?.length > 0
